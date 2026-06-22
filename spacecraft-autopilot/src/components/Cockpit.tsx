@@ -1,0 +1,1117 @@
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import * as THREE from 'three';
+import { Command } from 'lucide-react';
+import { TopBar } from './TopBar';
+import { DraggableWindow, WindowPosition } from './DraggableWindow';
+import { KeyboardShortcuts } from './KeyboardShortcuts';
+import { LoadingOverlay } from './LoadingOverlay';
+
+// Import window components
+import { TelemetryWindow } from './windows/TelemetryWindow';
+import { ArtificialHorizonWindow } from './windows/ArtificialHorizonWindow';
+import { SpacecraftConfigWindow } from './windows/SpacecraftConfigWindow';
+import { HelperArrowsWindow } from './windows/HelperArrowsWindow';
+import { PIDControllerWindow } from './windows/PIDControllerWindow';
+import { AutopilotWindow } from './windows/AutopilotWindow';
+import { SpacecraftListWindow } from './windows/SpacecraftListWindow';
+import { SettingsWindow } from './windows/SettingsWindow';
+import { DockingWindow } from './windows/DockingWindow';
+import { DockingCamerasWindow } from './windows/DockingCamerasWindow';
+import { DockingCameraView, PortId as DockingPortId } from './windows/DockingCameraView';
+import { ChartWindow } from './windows/ChartWindow';
+import type { ChartSource } from './windows/ChartWindow';
+import { Spacecraft } from '../core/spacecraft';
+import { useSettings } from '../state/store';
+import { setTelemetrySnapshot } from './windows/telemetrySnapshotStore';
+// FOV inputs now live inside DockingCameraView
+import { useElementSize } from '../hooks/useElementSize';
+import { SpacecraftController } from '../controllers/spacecraftController';
+
+type WindowKey = 'telemetry' | 'horizon' | 'spacecraftConfig' | 'arrows' | 'pid' | 'autopilot' | 'spacecraftList' | 'docking' | 'dockingCameras' | 'settings' | 'chart';
+
+interface WindowStates extends Record<string, boolean> {
+    telemetry: boolean;
+    horizon: boolean;
+    spacecraftConfig: boolean;
+    arrows: boolean;
+    pid: boolean;
+    autopilot: boolean;
+    spacecraftList: boolean;
+    docking: boolean;
+    dockingCameras: boolean;
+    settings: boolean;
+    chart: boolean;
+}
+
+interface WindowPositions {
+    [key: string]: WindowPosition;
+}
+
+interface CockpitProps {
+    spacecraft: Spacecraft;
+    spacecraftController: SpacecraftController;
+    loadingProgress?: number;
+    loadingStatus?: string;
+    onCreateNewSpacecraft?: () => void;
+    onCreateBlueprint?: (bp: import('./windows/SpacecraftListWindow').BlueprintType) => void;
+    onSceneLoad?: (presetId: string) => void;
+    spacecraftListVersion?: number;
+}
+
+interface AutopilotState {
+    pointToPosition: boolean;
+    goToPosition: boolean;
+}
+
+type CameraKey = string; // `${spacecraftUuid}:${DockingPortId}`
+interface CameraWindowState {
+    key: CameraKey;
+    spacecraftUuid: string;
+    portId: DockingPortId;
+    open: boolean;
+    position: WindowPosition;
+    size: { width?: number; height?: number };
+}
+
+const defaultWindowSize = { width: 280, height: 240 };
+// Rough footprint hints so we can keep new windows from stacking on top of one another
+const windowSizeHints: Record<WindowKey, { width: number; height: number }> = {
+    telemetry: { width: 280, height: 260 },
+    horizon: { width: 280, height: 280 },
+    spacecraftConfig: { width: 280, height: 340 },
+    arrows: { width: 260, height: 220 },
+    pid: { width: 320, height: 360 },
+    autopilot: { width: 340, height: 380 },
+    spacecraftList: { width: 320, height: 360 },
+    docking: { width: 340, height: 380 },
+    dockingCameras: { width: 320, height: 280 },
+    settings: { width: 300, height: 280 },
+    chart: { width: 400, height: 220 },
+};
+
+const rectanglesOverlap = (
+    aPos: WindowPosition,
+    aSize: { width: number; height: number },
+    bPos: WindowPosition,
+    bSize: { width: number; height: number }
+) =>
+    !(aPos.x + aSize.width <= bPos.x ||
+      aPos.x >= bPos.x + bSize.width ||
+      aPos.y + aSize.height <= bPos.y ||
+      aPos.y >= bPos.y + bSize.height);
+
+const calculateInitialPositions = (viewportWidth: number): WindowPositions => {
+    const padding = 10;
+    const topBarHeight = 10;
+    const titleBarHeight = 32;
+    const windowWidth = 250;
+    const horizonHeight = 240;
+
+    let currentLeftY = topBarHeight + padding;
+    const leftX = padding;
+
+    const rightX = viewportWidth - windowWidth - padding;
+    let currentRightY = topBarHeight + padding;
+
+    return {
+        telemetry: { x: leftX, y: currentLeftY },
+        horizon: { x: leftX, y: currentLeftY },
+        spacecraftConfig: { x: rightX, y: currentRightY },
+        pid: { x: rightX, y: currentRightY + titleBarHeight },
+        arrows: { x: rightX, y: currentRightY + titleBarHeight * 2 },
+        autopilot: { x: rightX, y: currentRightY + titleBarHeight * 3 + padding * 2 },
+        spacecraftList: { x: rightX, y: currentRightY },
+        docking: { x: leftX, y: currentLeftY + horizonHeight + padding * 2 },
+        dockingCameras: { x: leftX + 270, y: currentLeftY + horizonHeight + padding * 2 },
+        settings: { x: rightX, y: currentRightY + titleBarHeight * 4 + padding * 2 },
+        chart: { x: leftX + 270, y: currentLeftY },
+    };
+};
+
+export const Cockpit: React.FC<CockpitProps> = ({
+    spacecraft,
+    spacecraftController: controller,
+    loadingProgress = 100,
+    loadingStatus = '',
+    onCreateNewSpacecraft,
+    onCreateBlueprint,
+    onSceneLoad,
+    spacecraftListVersion = 0
+}) => {
+    // Get the world instance directly from the spacecraft
+    const world = spacecraft?.basicWorld ?? null;
+
+    // Chart data sources — closures capture spacecraft by ref, read live values at sample time
+    const chartSources = useMemo<ChartSource[]>(() => [
+        { id: 'vel.x', label: 'vel x', color: '#f87171', axis: 'left',  sample: () => spacecraft?.objects?.boxBody?.velocity?.x ?? null },
+        { id: 'vel.y', label: 'vel y', color: '#4ade80', axis: 'left',  sample: () => spacecraft?.objects?.boxBody?.velocity?.y ?? null },
+        { id: 'vel.z', label: 'vel z', color: '#60a5fa', axis: 'left',  sample: () => spacecraft?.objects?.boxBody?.velocity?.z ?? null },
+        { id: 'angvel', label: 'ang vel', color: '#facc15', axis: 'right', sample: () => {
+            const av = spacecraft?.objects?.boxBody?.angularVelocity;
+            return av ? Math.sqrt(av.x * av.x + av.y * av.y + av.z * av.z) : null;
+        }},
+        { id: 'fuel', label: 'fuel %', color: '#22d3ee', axis: 'right', sample: () => {
+            const tank = spacecraft?.getFuelTank?.();
+            return tank ? tank.fuelLevel * 100 : null;
+        }},
+        { id: 'fuel.kg', label: 'fuel kg', color: '#a78bfa', axis: 'right', sample: () => {
+            return spacecraft?.getFuelTank?.()?.fuelMass ?? null;
+        }},
+    ], [spacecraft]);
+
+    // State
+    const [visibleWindows, setVisibleWindows] = useState<WindowStates>({
+        telemetry: false,
+        horizon: true,
+        spacecraftConfig: false,
+        arrows: false,
+        pid: false,
+        autopilot: true,
+        spacecraftList: true,
+        docking: true,
+        dockingCameras: false,
+        settings: false,
+        chart: false,
+    });
+    const horizonVisible = visibleWindows.horizon;
+    const [windowPositions, setWindowPositions] = useState<WindowPositions>(calculateInitialPositions(typeof window !== 'undefined' ? window.innerWidth : 1024));
+    const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false);
+
+    // Z-order management for draggable windows
+    const initialZ = 100;
+    const [zCounter, setZCounter] = useState<number>(initialZ + 10);
+    const [windowZ, setWindowZ] = useState<Record<WindowKey, number>>({
+        spacecraftList:   initialZ + 1,
+        telemetry:        initialZ + 2,
+        horizon:          initialZ + 3,
+        spacecraftConfig: initialZ + 4,
+        arrows:           initialZ + 5,
+        pid:              initialZ + 6,
+        autopilot:        initialZ + 7,
+        docking:          initialZ + 8,
+        dockingCameras:   initialZ + 9,
+        settings:       initialZ + 11,
+        chart:          initialZ + 12,
+    });
+
+    useEffect(() => {
+        return () => {
+            setTelemetrySnapshot(null);
+        };
+    }, []);
+
+    const bringWindowToFront = (key: WindowKey) => {
+        setWindowZ(prev => ({ ...prev, [key]: zCounter + 1 }));
+        setZCounter(prev => prev + 1);
+    };
+
+    // Per-camera draggable windows + z-order
+    const [cameraWindows, setCameraWindows] = useState<Record<CameraKey, CameraWindowState>>({});
+    const [cameraWindowZ, setCameraWindowZ] = useState<Record<CameraKey, number>>({});
+    const bringCameraWindowToFront = (key: CameraKey) => {
+        setCameraWindowZ(prev => ({ ...prev, [key]: zCounter + 1 }));
+        setZCounter(prev => prev + 1);
+    };
+
+    // Refs
+    const horizonRef = useRef<HTMLCanvasElement>(null);
+    const targetMarkerRef = useRef<THREE.LineSegments | null>(null);
+    const horizonSceneRef = useRef<THREE.Scene | null>(null);
+    const horizonCameraRef = useRef<THREE.PerspectiveCamera | THREE.OrthographicCamera | null>(null);
+    const horizonRendererRef = useRef<THREE.WebGLRenderer | null>(null);
+    const sphereMeshRef = useRef<THREE.Mesh | null>(null);
+    const targetArrowRef = useRef<THREE.Mesh | null>(null);
+
+    const disposeHorizonResources = useCallback(() => {
+        if (horizonSceneRef.current) {
+            const disposeMaterial = (material: THREE.Material) => {
+                const matWithMap = material as THREE.Material & { map?: THREE.Texture | null };
+                matWithMap.map?.dispose?.();
+                material.dispose();
+            };
+
+            horizonSceneRef.current.traverse(obj => {
+                const mesh = obj as THREE.Mesh & { material?: THREE.Material | THREE.Material[]; geometry?: THREE.BufferGeometry };
+                const { geometry, material } = mesh;
+                if (geometry && typeof geometry.dispose === 'function') {
+                    geometry.dispose();
+                }
+                if (Array.isArray(material)) {
+                    material.forEach(disposeMaterial);
+                } else if (material) {
+                    disposeMaterial(material);
+                }
+            });
+            horizonSceneRef.current.clear();
+            horizonSceneRef.current = null;
+        }
+
+        if (horizonRendererRef.current) {
+            horizonRendererRef.current.dispose();
+            horizonRendererRef.current = null;
+        }
+
+        horizonCameraRef.current = null;
+        sphereMeshRef.current = null;
+        targetMarkerRef.current = null;
+        targetArrowRef.current = null;
+    }, []);
+
+    // Reactful resize handling using ResizeObserver on the UI container
+    const uiContainerRef = useRef<HTMLDivElement>(null);
+    const { width: uiWidth } = useElementSize(uiContainerRef.current);
+    const { width: horizonCanvasWidth, height: horizonCanvasHeight } = useElementSize(horizonRef.current);
+    useEffect(() => {
+        if (uiWidth > 0) setWindowPositions(calculateInitialPositions(uiWidth));
+    }, [uiWidth]);
+
+    const computeNonOverlappingPosition = useCallback(
+        (key: WindowKey, desired: WindowPosition, visible: WindowStates, currentPositions: WindowPositions): WindowPosition => {
+            const candidateSize = windowSizeHints[key] ?? defaultWindowSize;
+            const openWindows = (Object.entries(visible) as [WindowKey, boolean][]) 
+                .filter(([existingKey, isOpen]) => isOpen && existingKey !== key)
+                .map(([existingKey]) => {
+                    const pos = currentPositions[existingKey];
+                    if (!pos) return null;
+                    return {
+                        pos,
+                        size: windowSizeHints[existingKey] ?? defaultWindowSize,
+                    };
+                })
+                .filter((entry): entry is { pos: WindowPosition; size: { width: number; height: number } } => entry !== null);
+
+            const openCameraWindows = Object.values(cameraWindows)
+                .filter(w => w.open && w.position)
+                .map(w => ({
+                    pos: w.position,
+                    size: {
+                        width: w.size.width ?? defaultWindowSize.width,
+                        height: w.size.height ?? defaultWindowSize.height,
+                    },
+                }));
+
+            const others = [...openWindows, ...openCameraWindows];
+
+            const horizontalPadding = 20;
+            const topPadding = 60;
+            const viewportWidth = uiWidth > 0
+                ? uiWidth
+                : (typeof window !== 'undefined' ? window.innerWidth : 1024);
+            const viewportHeight = uiContainerRef.current?.getBoundingClientRect().height ??
+                (typeof window !== 'undefined' ? window.innerHeight : 768);
+
+            const clampPosition = (pos: WindowPosition): WindowPosition => ({
+                x: Math.min(
+                    Math.max(pos.x, horizontalPadding),
+                    Math.max(horizontalPadding, viewportWidth - candidateSize.width - horizontalPadding)
+                ),
+                y: Math.min(
+                    Math.max(pos.y, topPadding),
+                    Math.max(topPadding, viewportHeight - candidateSize.height - horizontalPadding)
+                ),
+            });
+
+            const fitsWithoutOverlap = (pos: WindowPosition) =>
+                !others.some(({ pos: otherPos, size }) => rectanglesOverlap(pos, candidateSize, otherPos, size));
+
+            let candidate = clampPosition(desired);
+            const step = 36;
+            const maxAttempts = 60;
+
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                if (fitsWithoutOverlap(candidate)) return candidate;
+
+                let nextX = candidate.x + step;
+                let nextY = candidate.y + step;
+
+                if (nextX + candidateSize.width > viewportWidth - horizontalPadding) {
+                    nextX = horizontalPadding;
+                }
+                if (nextY + candidateSize.height > viewportHeight - horizontalPadding) {
+                    nextY = topPadding;
+                }
+
+                candidate = clampPosition({ x: nextX, y: nextY });
+            }
+
+            return candidate;
+        },
+        [cameraWindows, uiWidth]
+    );
+
+    const { attitudeSphereTexture, uiTheme } = useSettings();
+    const themeAccentHex = uiTheme === 'b' ? '#94a3b8' : uiTheme === 'c' ? '#7dd3fc' : '#22d3ee';
+    const crosshairBaseHex = uiTheme === 'b' ? '#ffffff' : '#ffffff';
+
+    const toggleCameraWindow = useCallback((spacecraftUuid: string, portId: DockingPortId) => {
+        setCameraWindows(prev => {
+            const key: CameraKey = `${spacecraftUuid}:${portId}`;
+            const existing = prev[key];
+                if (existing) {
+                    const nextOpen = !existing.open;
+                    return { ...prev, [key]: { ...existing, open: nextOpen } };
+                }
+            // New window: position it near the docking cameras window by default
+            const basePos = windowPositions.dockingCameras || { x: 20, y: 20 };
+            const openCount = Object.values(prev).filter(w => w.open).length;
+            const offset = openCount * 30;
+            const newWin: CameraWindowState = {
+                key,
+                spacecraftUuid,
+                portId,
+                open: true,
+                position: { x: basePos.x + 280 + offset, y: basePos.y + offset },
+                size: { width: 320, height: 200 },
+            };
+            return { ...prev, [key]: newWin };
+        });
+        setCameraWindowZ(prev => {
+            const key: CameraKey = `${spacecraftUuid}:${portId}`;
+            if (prev[key] != null) return prev;
+            return { ...prev, [key]: zCounter + 1 };
+        });
+        setZCounter(prev => prev + 1);
+    }, [windowPositions.dockingCameras, zCounter]);
+
+    const setCameraWindowPosition = useCallback((key: CameraKey, pos: WindowPosition) => {
+        setCameraWindows(prev => prev[key] ? { ...prev, [key]: { ...prev[key], position: pos } } : prev);
+    }, []);
+
+    const setCameraWindowSize = useCallback((key: CameraKey, size: { width?: number; height?: number }) => {
+        setCameraWindows(prev => prev[key] ? { ...prev, [key]: { ...prev[key], size: { ...prev[key].size, ...size } } } : prev);
+    }, []);
+
+    const updateTelemetry = useCallback(() => {
+        if (spacecraft?.objects?.box) {
+            // Avoid calling into Rapier from this separate RAF. Read the cached
+            // values synchronized by SpacecraftModel.update() after the physics step.
+            const v = spacecraft.objects?.boxBody?.velocity ?? new THREE.Vector3();
+            const av = spacecraft.objects?.boxBody?.angularVelocity ?? new THREE.Vector3();
+            const quaternion = spacecraft.objects.box?.quaternion ?? { x: 0, y: 0, z: 0, w: 1 };
+
+            // Update telemetry values for display
+            setTelemetrySnapshot({
+                position: spacecraft.objects.box.position,
+                velocity: new THREE.Vector3(
+                    Number((v.x ?? 0).toFixed?.(2) ?? v.x ?? 0),
+                    Number((v.y ?? 0).toFixed?.(2) ?? v.y ?? 0),
+                    Number((v.z ?? 0).toFixed?.(2) ?? v.z ?? 0)
+                ),
+                orientation: new THREE.Quaternion(
+                    quaternion.x ?? 0,
+                    quaternion.y ?? 0,
+                    quaternion.z ?? 0,
+                    quaternion.w ?? 1
+                ),
+                angularVelocity: new THREE.Vector3(
+                    Number((av.x ?? 0).toFixed?.(2) ?? av.x ?? 0),
+                    Number((av.y ?? 0).toFixed?.(2) ?? av.y ?? 0),
+                    Number((av.z ?? 0).toFixed?.(2) ?? av.z ?? 0)
+                ),
+                mass: spacecraft.getMass() ?? 0,
+                thrusterStatus: [...(spacecraft.getThrusterStatus() ?? [])]
+            });
+
+            // Update horizon directly for smoother motion
+            if (sphereMeshRef.current && horizonRendererRef.current && horizonSceneRef.current && horizonCameraRef.current) {
+                const renderer = horizonRendererRef.current;
+                const scene = horizonSceneRef.current;
+                const camera = horizonCameraRef.current;
+
+                // Create a rotation matrix from the raw quaternion
+                const rotationMatrix = new THREE.Matrix4().makeRotationFromQuaternion(
+                    new THREE.Quaternion(quaternion.x, quaternion.y, quaternion.z, quaternion.w)
+                );
+
+                // Apply the inverse rotation to show the horizon from spacecraft's perspective
+                rotationMatrix.invert();
+                sphereMeshRef.current.setRotationFromMatrix(rotationMatrix);
+
+                // Update target marker if point-to-position is active
+                const autopilot = controller?.getAutopilot();
+                const autopilotState = autopilot?.getActiveAutopilots() as AutopilotState | undefined;
+                const targetPosition = autopilot?.getTargetPosition();
+                const wp = spacecraft?.getWorldPosition();
+
+                if ((autopilotState?.pointToPosition || autopilotState?.goToPosition) && targetPosition && wp && targetMarkerRef.current) {
+                    const targetVec = new THREE.Vector3(targetPosition.x, targetPosition.y, targetPosition.z);
+                    const currentVec = new THREE.Vector3(wp.x, wp.y, wp.z);
+
+                    // Calculate direction to target in world space
+                    const direction = new THREE.Vector3()
+                        .subVectors(targetVec, currentVec)
+                        .normalize();
+
+                // Transform direction using the same inverse rotation applied to the sphere
+                // Result is horizon-scene camera-space direction aligned with our camera axes
+                const cameraSpaceDir = direction.clone().applyMatrix4(rotationMatrix);
+
+                    // Project the direction onto the view plane
+                    // Compute edge radius from camera (supports perspective or orthographic)
+                    const cam = horizonCameraRef.current!;
+                    const planeZ = 0.4;
+                    let rEdge = 0.45;
+                    if ((cam as any).isPerspectiveCamera) {
+                        const pc = cam as THREE.PerspectiveCamera;
+                        const d = Math.max(1e-6, pc.position.z - planeZ);
+                        const halfH = d * Math.tan(THREE.MathUtils.degToRad(pc.fov * 0.5));
+                        const halfW = halfH * Math.max(1e-6, pc.aspect);
+                        rEdge = Math.min(halfW, halfH) * 0.98;
+                    } else if ((cam as any).isOrthographicCamera) {
+                        const oc = cam as THREE.OrthographicCamera;
+                        const halfW = (oc.right - oc.left) / 2;
+                        const halfH = (oc.top - oc.bottom) / 2;
+                        rEdge = Math.min(halfW, halfH) * 0.98;
+                    }
+
+                    // Use perspective-like mapping for consistency across camera types
+                    const isInFront = cameraSpaceDir.z > 0;
+                    const denom = Math.max(1e-6, Math.abs(cameraSpaceDir.z));
+                    // Mirror to match sphere texture/yaw flip
+                    const projectedX = -(cameraSpaceDir.x / denom) * rEdge;
+                    const projectedY = -(cameraSpaceDir.y / denom) * rEdge;
+
+                    const r = Math.hypot(projectedX, projectedY);
+                    const angle = Math.atan2(projectedY, projectedX);
+
+                    const arrow = targetArrowRef.current;
+
+                    // Determine visibility and placement
+                    const insideCircle = r <= rEdge * 0.95;
+
+                    if (isInFront && insideCircle) {
+                        // Show red X at the projected position
+                        targetMarkerRef.current.visible = true;
+                        targetMarkerRef.current.position.set(projectedX, projectedY, 0.4);
+
+                        // Keep X a consistent size for legibility
+                        targetMarkerRef.current.scale.setScalar(1.0);
+                        targetMarkerRef.current.rotation.z = 0;
+
+                        if (arrow) arrow.visible = false;
+                    } else {
+                        // Show an arrow at the edge pointing toward the target
+                        targetMarkerRef.current.visible = false;
+                        if (arrow) {
+                            const clampedR = r > 1e-6 ? rEdge : 0;
+                            const edgeX = r > 1e-6 ? (projectedX / r) * clampedR : 0;
+                            const edgeY = r > 1e-6 ? (projectedY / r) * clampedR : 0;
+                            arrow.visible = true;
+                            arrow.position.set(edgeX, edgeY, 0.49);
+                            arrow.rotation.z = angle; // arrow tip points outward toward the target
+                        }
+                    }
+                } else {
+                    if (targetMarkerRef.current) targetMarkerRef.current.visible = false;
+                    if (targetArrowRef.current) targetArrowRef.current.visible = false;
+                }
+
+                // Render the horizon
+                renderer.render(scene, camera);
+            }
+        }
+    }, [spacecraft, controller]);
+
+    // Remove the separate horizon update effect since we're now updating it in the animation frame
+    useEffect(() => {
+        let animationFrameId: number;
+
+        const animate = () => {
+            updateTelemetry();
+            animationFrameId = requestAnimationFrame(animate);
+        };
+
+        animate();
+
+        return () => {
+            cancelAnimationFrame(animationFrameId);
+            if (horizonRendererRef.current) {
+                horizonRendererRef.current.dispose();
+            }
+        };
+    }, [spacecraft, controller, updateTelemetry]);
+
+    // Keep horizon renderer in sync with canvas size
+    useEffect(() => {
+        const renderer = horizonRendererRef.current;
+        const camera = horizonCameraRef.current;
+        if (!renderer || !camera) return;
+
+        const w = Math.max(1, Math.floor(horizonCanvasWidth || 0));
+        const h = Math.max(1, Math.floor(horizonCanvasHeight || 0));
+        if (w > 0 && h > 0) {
+            const dpr = Math.min(window.devicePixelRatio || 1, 2);
+            renderer.setPixelRatio(dpr);
+            renderer.setSize(w, h, false);
+            const aspect = w / h;
+            if ((camera as any).isPerspectiveCamera) {
+                const pc = camera as THREE.PerspectiveCamera;
+                pc.aspect = aspect;
+                pc.updateProjectionMatrix();
+            } else if ((camera as any).isOrthographicCamera) {
+                const oc = camera as THREE.OrthographicCamera;
+                const size = 1; // world units to show vertically
+                oc.top = size;
+                oc.bottom = -size;
+                oc.left = -size * aspect;
+                oc.right = size * aspect;
+                oc.updateProjectionMatrix();
+            }
+        }
+    }, [horizonCanvasWidth, horizonCanvasHeight]);
+
+    // Initialize horizon
+    useEffect(() => {
+        if (!horizonVisible) {
+            disposeHorizonResources();
+            return;
+        }
+
+        let cancelled = false;
+
+        const initializeHorizon = async () => {
+            disposeHorizonResources();
+            const canvas = horizonRef.current;
+            if (!canvas) return;
+
+            try {
+                const scene = new THREE.Scene();
+                horizonSceneRef.current = scene;
+
+                const flattenPerspective = true;
+                let camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+                if (flattenPerspective) {
+                    const aspect = 1;
+                    const size = 1;
+                    const orthoCamera = new THREE.OrthographicCamera(
+                        -size * aspect,
+                        size * aspect,
+                        size,
+                        -size,
+                        0.1,
+                        10
+                    );
+                    orthoCamera.position.z = 1.2;
+                    camera = orthoCamera;
+                } else {
+                    const perspectiveCamera = new THREE.PerspectiveCamera(60, 1, 0.1, 1000);
+                    perspectiveCamera.position.z = 1.2;
+                    camera = perspectiveCamera;
+                }
+                horizonCameraRef.current = camera;
+
+                const renderer = new THREE.WebGLRenderer({
+                    canvas,
+                    alpha: true,
+                    antialias: true,
+                    logarithmicDepthBuffer: true
+                });
+                horizonRendererRef.current = renderer;
+
+                const cw = Math.max(1, Math.floor(canvas.clientWidth || 200));
+                const ch = Math.max(1, Math.floor(canvas.clientHeight || 200));
+                const dpr = Math.min(window.devicePixelRatio || 1, 2);
+                renderer.setPixelRatio(dpr);
+                renderer.setSize(cw, ch, false);
+                renderer.setClearColor(0x000000, 0.2);
+
+                const textureLoader = new THREE.TextureLoader();
+                const texture = await new Promise<THREE.Texture>((resolve, reject) => {
+                    textureLoader.load(
+                        attitudeSphereTexture || '/images/textures/rLHbWVB.png',
+                        resolve,
+                        undefined,
+                        reject
+                    );
+                });
+
+                if (cancelled) {
+                    texture.dispose();
+                    renderer.dispose();
+                    return;
+                }
+
+                texture.mapping = THREE.EquirectangularReflectionMapping;
+                texture.minFilter = THREE.LinearMipmapLinearFilter;
+                texture.magFilter = THREE.LinearFilter;
+                const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
+                texture.anisotropy = maxAnisotropy;
+                texture.repeat.x = -1;
+                texture.offset.x = 1;
+
+                const sphereGeometry = new THREE.SphereGeometry(1, 64, 64);
+                const sphereMaterial = new THREE.MeshBasicMaterial({
+                    map: texture,
+                    side: THREE.BackSide,
+                    transparent: true,
+                    opacity: 1
+                });
+                const sphereMesh = new THREE.Mesh(sphereGeometry, sphereMaterial);
+                sphereMesh.rotation.y = Math.PI;
+                scene.add(sphereMesh);
+                sphereMeshRef.current = sphereMesh;
+
+                const crosshairGroup = new THREE.Group();
+
+                const mainLineSize = 0.15;
+                const mainLineWidth = 10;
+                const mainVertices = new Float32Array([
+                    -mainLineSize, 0, 0, mainLineSize, 0, 0,
+                    0, -mainLineSize, 0, 0, mainLineSize, 0
+                ]);
+                const mainGeometry = new THREE.BufferGeometry();
+                mainGeometry.setAttribute('position', new THREE.BufferAttribute(mainVertices, 3));
+                const mainMaterial = new THREE.LineBasicMaterial({
+                    color: new THREE.Color(crosshairBaseHex),
+                    opacity: 0.9,
+                    transparent: true,
+                    linewidth: mainLineWidth
+                });
+                const mainCrosshair = new THREE.LineSegments(mainGeometry, mainMaterial);
+                crosshairGroup.add(mainCrosshair);
+
+                const dotGeometry = new THREE.CircleGeometry(0.005, 32);
+                const dotMaterial = new THREE.MeshBasicMaterial({
+                    color: new THREE.Color(crosshairBaseHex),
+                    opacity: 0.9,
+                    transparent: true
+                });
+                const dot = new THREE.Mesh(dotGeometry, dotMaterial);
+                crosshairGroup.add(dot);
+
+                const tickSize = 0.05;
+                const tickVertices = new Float32Array([
+                    -mainLineSize - tickSize, 0, 0, -mainLineSize, 0, 0,
+                    mainLineSize, 0, 0, mainLineSize + tickSize, 0, 0,
+                    0, mainLineSize, 0, 0, mainLineSize + tickSize, 0,
+                    0, -mainLineSize - tickSize, 0, 0, -mainLineSize, 0
+                ]);
+                const tickGeometry = new THREE.BufferGeometry();
+                tickGeometry.setAttribute('position', new THREE.BufferAttribute(tickVertices, 3));
+                const tickMaterial = new THREE.LineBasicMaterial({
+                    color: new THREE.Color(crosshairBaseHex),
+                    opacity: 0.7,
+                    transparent: true,
+                    linewidth: 2
+                });
+                const ticks = new THREE.LineSegments(tickGeometry, tickMaterial);
+                crosshairGroup.add(ticks);
+
+                const targetMarkerSize = 0.08;
+                const targetMarkerGeometry = new THREE.BufferGeometry();
+                const targetMarkerVertices = new Float32Array([
+                    -targetMarkerSize, -targetMarkerSize, 0,  targetMarkerSize,  targetMarkerSize, 0,
+                     targetMarkerSize, -targetMarkerSize, 0, -targetMarkerSize,  targetMarkerSize, 0,
+                ]);
+                targetMarkerGeometry.setAttribute('position', new THREE.BufferAttribute(targetMarkerVertices, 3));
+                const targetMarkerMaterial = new THREE.LineBasicMaterial({
+                    color: new THREE.Color(themeAccentHex),
+                    opacity: 1.0,
+                    transparent: true,
+                    linewidth: 6,
+                    depthTest: false
+                });
+                const targetMarker = new THREE.LineSegments(targetMarkerGeometry, targetMarkerMaterial);
+                targetMarker.position.z = 0.4;
+                targetMarker.visible = false;
+                scene.add(targetMarker);
+                targetMarkerRef.current = targetMarker;
+
+                const arrowLength = 0.12;
+                const arrowWidth = 0.08;
+                const arrowGeometry = new THREE.BufferGeometry();
+                const arrowVertices = new Float32Array([
+                    0, 0, 0,
+                    -arrowLength,  arrowWidth / 2, 0,
+                    -arrowLength, -arrowWidth / 2, 0,
+                ]);
+                arrowGeometry.setAttribute('position', new THREE.BufferAttribute(arrowVertices, 3));
+                arrowGeometry.setIndex([0, 1, 2]);
+                arrowGeometry.computeVertexNormals();
+                const arrowMaterial = new THREE.MeshBasicMaterial({ color: new THREE.Color(themeAccentHex), opacity: 0.95, transparent: true, depthTest: false });
+                const arrowMesh = new THREE.Mesh(arrowGeometry, arrowMaterial);
+                arrowMesh.position.z = 0.49;
+                arrowMesh.visible = false;
+                scene.add(arrowMesh);
+                targetArrowRef.current = arrowMesh;
+
+                crosshairGroup.position.z = 0.5;
+                scene.add(crosshairGroup);
+
+                (crosshairGroup as any)._mainMat = mainMaterial;
+                (crosshairGroup as any)._dotMat = dotMaterial;
+                (crosshairGroup as any)._tickMat = tickMaterial;
+
+                if (cancelled) {
+                    texture.dispose();
+                    return;
+                }
+            } catch (error) {
+                console.error('Error initializing horizon:', error);
+                disposeHorizonResources();
+            }
+        };
+
+        initializeHorizon();
+
+        return () => {
+            cancelled = true;
+            disposeHorizonResources();
+        };
+    }, [horizonVisible, disposeHorizonResources]);
+
+    // Update sphere texture when selection changes after initialization
+    useEffect(() => {
+        const applyTexture = async () => {
+            if (!sphereMeshRef.current || !horizonRendererRef.current) return;
+            try {
+                const textureLoader = new THREE.TextureLoader();
+                const newTexture = await new Promise<THREE.Texture>((resolve, reject) => {
+                    textureLoader.load(
+                        attitudeSphereTexture || '/images/textures/rLHbWVB.png',
+                        resolve,
+                        undefined,
+                        reject
+                    );
+                });
+                newTexture.mapping = THREE.EquirectangularReflectionMapping;
+                newTexture.minFilter = THREE.LinearMipmapLinearFilter;
+                newTexture.magFilter = THREE.LinearFilter;
+                const maxAnisotropy = horizonRendererRef.current.capabilities.getMaxAnisotropy();
+                newTexture.anisotropy = maxAnisotropy;
+                newTexture.repeat.x = -1;
+                newTexture.offset.x = 1;
+
+                const mat = sphereMeshRef.current.material as THREE.MeshBasicMaterial;
+                const oldTex = mat.map;
+                mat.map = newTexture;
+                mat.needsUpdate = true;
+                // Dispose previous to free GPU memory
+                if (oldTex) oldTex.dispose();
+            } catch (err) {
+                console.error('Failed to update sphere texture', err);
+            }
+        };
+        applyTexture();
+    }, [attitudeSphereTexture]);
+
+    // Update horizon UI accent and crosshair when theme changes
+    useEffect(() => {
+        const accent = new THREE.Color(themeAccentHex);
+        if (targetMarkerRef.current) {
+            const mat = targetMarkerRef.current.material as THREE.LineBasicMaterial;
+            mat.color.copy(accent);
+            mat.needsUpdate = true;
+        }
+        if (targetArrowRef.current) {
+            const mat = targetArrowRef.current.material as THREE.MeshBasicMaterial;
+            mat.color.copy(accent);
+            mat.needsUpdate = true;
+        }
+        // Crosshair colors adjust for light theme
+        const scene = horizonSceneRef.current;
+        if (scene) {
+            scene.traverse(obj => {
+                const grp = obj as any;
+                if (grp && grp._mainMat && grp._tickMat && grp._dotMat) {
+                    const base = new THREE.Color(crosshairBaseHex);
+                    (grp._mainMat as THREE.LineBasicMaterial).color.copy(base);
+                    (grp._mainMat as THREE.LineBasicMaterial).needsUpdate = true;
+                    (grp._tickMat as THREE.LineBasicMaterial).color.copy(base);
+                    (grp._tickMat as THREE.LineBasicMaterial).needsUpdate = true;
+                    (grp._dotMat as THREE.MeshBasicMaterial).color.copy(base);
+                    (grp._dotMat as THREE.MeshBasicMaterial).needsUpdate = true;
+                }
+            });
+        }
+    }, [uiTheme]);
+
+    // Removed global FOV overlay; per-camera FOV controls live in DockingCameraView
+
+    const toggleWindow = (windowName: string) => {
+        setVisibleWindows(prev => {
+            const key = windowName as WindowKey;
+            const opening = !prev[key];
+            if (opening) {
+                bringWindowToFront(key);
+                setWindowPositions(previousPositions => {
+                    const desired = previousPositions[key] ?? { x: 20, y: 20 };
+                    const adjusted = computeNonOverlappingPosition(key, desired, prev, previousPositions);
+                    return { ...previousPositions, [key]: adjusted };
+                });
+            }
+            return { ...prev, [windowName]: opening } as WindowStates;
+        });
+    };
+
+    const updateWindowPosition = (key: string, position: WindowPosition) => {
+        setWindowPositions(prev => ({
+            ...prev,
+            [key]: position
+        }));
+    };
+
+    const handleSelectSpacecraft = (selectedSpacecraft: Spacecraft) => {
+        if (selectedSpacecraft && selectedSpacecraft !== spacecraft && world) {
+            world.setActiveSpacecraft(selectedSpacecraft);
+        }
+    };
+
+    const handleDeleteSpacecraft = (spacecraftToDelete: Spacecraft) => {
+        if (spacecraftToDelete === spacecraft) return; // Don't delete active spacecraft
+        if (world) {
+            world.deleteSpacecraft(spacecraftToDelete);
+        }
+    };
+
+    return (
+        <div ref={uiContainerRef} className={`relative w-full h-full theme-${uiTheme}`}>
+            {loadingProgress < 100 && (
+                <LoadingOverlay progress={loadingProgress} status={loadingStatus} />
+            )}
+            <div className="fixed inset-0 text-xs pt-8 font-['Menlo','Monaco','Courier_New',monospace] pointer-events-none">
+                <div className="pointer-events-auto">
+                    <TopBar
+                        visibleWindows={visibleWindows}
+                        onToggleWindow={toggleWindow}
+                        onCreateNewSpacecraft={onCreateNewSpacecraft ?? (() => { })}
+                        world={world}
+                        onSceneLoad={onSceneLoad}
+                    />
+                </div>
+
+                <div className="pointer-events-none">
+                    {visibleWindows.spacecraftList && (
+                        <DraggableWindow
+                            title="Spacecraft Manager"
+                            defaultPosition={windowPositions.spacecraftList}
+                            onPositionChange={(pos: WindowPosition) => updateWindowPosition('spacecraftList', pos)}
+                            initiallyCollapsed={false}
+                            isVisible={visibleWindows.spacecraftList}
+                            zIndex={windowZ.spacecraftList}
+                            onFocus={() => bringWindowToFront('spacecraftList')}
+                            onClose={() => toggleWindow('spacecraftList')}
+                        >
+                            <SpacecraftListWindow
+                                world={world}
+                                activeSpacecraft={spacecraft}
+                                onCreateSpacecraft={onCreateNewSpacecraft ?? (() => { })}
+                                onCreateBlueprint={onCreateBlueprint ?? (() => { })}
+                                onSelectSpacecraft={handleSelectSpacecraft}
+                                onDeleteSpacecraft={handleDeleteSpacecraft}
+                                version={spacecraftListVersion}
+                            />
+                        </DraggableWindow>
+                    )}
+
+                    {visibleWindows.telemetry && (
+                        <DraggableWindow
+                            title="Flight Telemetry"
+                            defaultPosition={windowPositions.telemetry}
+                            onPositionChange={(pos: WindowPosition) => updateWindowPosition('telemetry', pos)}
+                            initiallyCollapsed={false}
+                            isVisible={visibleWindows.telemetry}
+                            zIndex={windowZ.telemetry}
+                            onFocus={() => bringWindowToFront('telemetry')}
+                            onClose={() => toggleWindow('telemetry')}
+                        >
+                            <TelemetryWindow />
+                        </DraggableWindow>
+                    )}
+
+                    {visibleWindows.horizon && (
+                        <DraggableWindow
+                            title="Attitude Indicator"
+                            defaultPosition={windowPositions.horizon}
+                            onPositionChange={(pos: WindowPosition) => updateWindowPosition('horizon', pos)}
+                            initiallyCollapsed={false}
+                            isVisible={visibleWindows.horizon}
+                            zIndex={windowZ.horizon}
+                            onFocus={() => bringWindowToFront('horizon')}
+                            onClose={() => toggleWindow('horizon')}
+                        >
+                            <ArtificialHorizonWindow horizonRef={horizonRef} />
+                        </DraggableWindow>
+                    )}
+
+                    {visibleWindows.spacecraftConfig && (
+                        <DraggableWindow
+                            title="Spacecraft Config"
+                            defaultPosition={windowPositions.spacecraftConfig}
+                            onPositionChange={(pos: WindowPosition) => updateWindowPosition('spacecraftConfig', pos)}
+                            isVisible={visibleWindows.spacecraftConfig}
+                            zIndex={windowZ.spacecraftConfig}
+                            onFocus={() => bringWindowToFront('spacecraftConfig')}
+                            onClose={() => toggleWindow('spacecraftConfig')}
+                        >
+                            <SpacecraftConfigWindow spacecraft={spacecraft} />
+                        </DraggableWindow>
+                    )}
+
+                    {visibleWindows.arrows && (
+                        <DraggableWindow
+                            title="Visualization Aids"
+                            defaultPosition={windowPositions.arrows}
+                            onPositionChange={(pos: WindowPosition) => updateWindowPosition('arrows', pos)}
+                            isVisible={visibleWindows.arrows}
+                            zIndex={windowZ.arrows}
+                            onFocus={() => bringWindowToFront('arrows')}
+                            onClose={() => toggleWindow('arrows')}
+                        >
+                            <HelperArrowsWindow spacecraft={spacecraft} world={world} />
+                        </DraggableWindow>
+                    )}
+
+                    {visibleWindows.pid && (
+                        <DraggableWindow
+                            title="PID Tuning"
+                            defaultPosition={windowPositions.pid}
+                            onPositionChange={(pos: WindowPosition) => updateWindowPosition('pid', pos)}
+                            isVisible={visibleWindows.pid}
+                            zIndex={windowZ.pid}
+                            onFocus={() => bringWindowToFront('pid')}
+                            onClose={() => toggleWindow('pid')}
+                        >
+                            <PIDControllerWindow 
+                                controller={controller?.getAutopilot()?.getOrientationPidController() ?? null}
+                                rotationCancelController={controller?.getAutopilot()?.getRotationCancelPidController?.() ?? null}
+                                linearController={controller?.getAutopilot()?.getLinearPidController() ?? null}
+                                momentumController={controller?.getAutopilot()?.getMomentumPidController() ?? null}
+                                autopilot={controller?.getAutopilot() ?? null}
+                            />
+                        </DraggableWindow>
+                    )}
+
+                    {visibleWindows.autopilot && (
+                        <DraggableWindow
+                            title="Autopilot & Targeting"
+                            defaultPosition={windowPositions.autopilot}
+                            onPositionChange={(pos: WindowPosition) => updateWindowPosition('autopilot', pos)}
+                            initiallyCollapsed={false}
+                            isVisible={visibleWindows.autopilot}
+                            zIndex={windowZ.autopilot}
+                            onFocus={() => bringWindowToFront('autopilot')}
+                            onClose={() => toggleWindow('autopilot')}
+                        >
+                            <AutopilotWindow
+                                spacecraft={spacecraft}
+                                controller={controller}
+                                world={world}
+                                version={spacecraftListVersion}
+                            />
+                        </DraggableWindow>
+                    )}
+
+                    {visibleWindows.docking && (
+                        <DraggableWindow
+                            title="Docking Guidance"
+                            defaultPosition={windowPositions.docking}
+                            onPositionChange={(pos) => updateWindowPosition('docking', pos)}
+                            onClose={() => toggleWindow('docking')}
+                            zIndex={windowZ.docking}
+                            onFocus={() => bringWindowToFront('docking')}
+                        >
+                        <DockingWindow
+                            spacecraft={spacecraft}
+                            controller={controller}
+                            world={world}
+                            version={spacecraftListVersion}
+                        />
+                        </DraggableWindow>
+                    )}
+
+                    {visibleWindows.dockingCameras && (
+                        <DraggableWindow
+                            title="Docking Cameras & Lights"
+                            defaultPosition={windowPositions.dockingCameras}
+                            onPositionChange={(pos) => updateWindowPosition('dockingCameras', pos)}
+                            onClose={() => toggleWindow('dockingCameras')}
+                            zIndex={windowZ.dockingCameras}
+                            onFocus={() => bringWindowToFront('dockingCameras')}
+                        >
+                            <DockingCamerasWindow 
+                                world={world} 
+                                version={spacecraftListVersion}
+                                onToggleCamera={toggleCameraWindow}
+                                openCameraKeys={Object.values(cameraWindows).filter(w => w.open).map(w => w.key)}
+                            />
+                        </DraggableWindow>
+                    )}
+                    {visibleWindows.settings && (
+                        <DraggableWindow
+                            title="Display Settings"
+                            defaultPosition={windowPositions.settings}
+                            onPositionChange={(pos) => updateWindowPosition('settings', pos)}
+                            onClose={() => toggleWindow('settings')}
+                            initiallyCollapsed={false}
+                            isVisible={visibleWindows.settings}
+                            zIndex={windowZ.settings}
+                            onFocus={() => bringWindowToFront('settings')}
+                        >
+                            <SettingsWindow world={world} onSceneLoad={onSceneLoad} />
+                        </DraggableWindow>
+                    )}
+                    {visibleWindows.chart && (
+                        <DraggableWindow
+                            title="Chart"
+                            defaultPosition={windowPositions.chart}
+                            onPositionChange={(pos) => updateWindowPosition('chart', pos)}
+                            onClose={() => toggleWindow('chart')}
+                            resizable={true}
+                            defaultWidth={400}
+                            defaultHeight={220}
+                            isVisible={visibleWindows.chart}
+                            zIndex={windowZ.chart}
+                            onFocus={() => bringWindowToFront('chart')}
+                        >
+                            <ChartWindow sources={chartSources} />
+                        </DraggableWindow>
+                    )}
+                    {Object.values(cameraWindows).filter(w => w.open).map(w => {
+                        const sc = world?.getSpacecraftList?.().find(s => s.uuid === w.spacecraftUuid) ?? null;
+                        const title = `Docking Camera: ${sc?.name ?? 'Unknown'} ${w.portId === 'front' ? 'Front' : 'Back'}`;
+                        return (
+                            <DraggableWindow
+                                key={w.key}
+                                title={title}
+                                defaultPosition={w.position}
+                                onPositionChange={(pos) => setCameraWindowPosition(w.key, pos)}
+                                initiallyCollapsed={false}
+                                isVisible={true}
+                                resizable={true}
+                                defaultWidth={w.size.width}
+                                defaultHeight={w.size.height}
+                                onSizeChange={(size) => setCameraWindowSize(w.key, size)}
+                                onClose={() => toggleCameraWindow(w.spacecraftUuid, w.portId)}
+                                zIndex={cameraWindowZ[w.key]}
+                                onFocus={() => bringCameraWindowToFront(w.key)}
+                            >
+                                <div className="w-full h-full">
+                                    <DockingCameraView 
+                                        world={world ?? null}
+                                        spacecraft={sc}
+                                        portId={w.portId}
+                                    />
+                                </div>
+                            </DraggableWindow>
+                        );
+                    })}
+                </div>
+
+                <button
+                    className="fixed bottom-2 right-2 w-6 h-6 bg-black/60 rounded flex items-center justify-center text-white/90 cursor-pointer text-[10px] hover:bg-white/20 transition-colors border border-white/20 pointer-events-auto"
+                    onClick={() => setShowKeyboardShortcuts(true)}
+                >
+                    <Command size={14} />
+                </button>
+
+                {/* Per-camera FOV controls are embedded inside each DockingCameraView */}
+            </div>
+
+            <KeyboardShortcuts
+                isVisible={showKeyboardShortcuts}
+                onClose={() => setShowKeyboardShortcuts(false)}
+            />
+        </div>
+    );
+}; 

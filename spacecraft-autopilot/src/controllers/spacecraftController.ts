@@ -1,0 +1,559 @@
+import * as THREE from 'three';
+import { Spacecraft } from '../core/spacecraft';
+import { Autopilot } from './autopilot/Autopilot';
+import { createLogger } from '../utils/logger';
+import { getBasicThrusterGroups } from '../config/spacecraftConfig';
+import type { ThrusterGroups } from '../config/spacecraftConfig';
+import { computeThrusterGroups } from '../utils/utils';
+import type { ThrusterConfig } from '../utils/utils';
+import { ManualAllocator } from './autopilot/ManualAllocator';
+import { ThrusterPWM } from './ThrusterPWM';
+import type { CompoundControlAuthority } from './CompoundControlAuthority';
+import type { VisualizationCallbacks } from './types';
+import { THRUST_FACTOR } from '../constants';
+import { emitAutopilotStateChanged } from '../domain/simulationEvents';
+
+interface KeyMap {
+    [key: string]: boolean;
+}
+
+// Removed unused ThrusterMap after switching manual control to vector allocation
+
+export class SpacecraftController {
+    private log = createLogger('controllers:SpacecraftController');
+    private isActive: boolean = false;
+    private spacecraft!: Spacecraft;
+    private currentTarget!: string | null;
+    private helpers!: VisualizationCallbacks;
+    private keysPressed!: KeyMap;
+    private mass!: number;
+    private thrust!: number;
+    private thrusterMax: number[] = new Array(24).fill(0);
+    public autopilot!: Autopilot;
+    private thrusterPWM!: ThrusterPWM;
+    // Reusable buffers to avoid per-frame allocations
+    private manualForcesBuffer: number[] = new Array(24).fill(0);
+    private combinedForcesBuffer: number[] = new Array(24).fill(0);
+    private manualAllocator!: ManualAllocator;
+    // Cluster-aware scaling
+    private baseThrust!: number;
+    private isClusterScaling = false;
+    // Compound body delegation
+    private compoundAuthority: CompoundControlAuthority | null = null;
+    // Reserved for future: per-thruster custom caps provided by user/config
+    // no waypoint planner
+
+    constructor(spacecraft: Spacecraft, currentTarget: { uuid: string } | null, helpers: VisualizationCallbacks) {
+        this.log.debug('SpacecraftController constructor called');
+        this.initializeProperties(spacecraft, currentTarget, helpers);
+        this.log.debug('SpacecraftController initialized, isActive:', this.isActive);
+    }
+
+    public getIsActive(): boolean {
+        return this.isActive;
+    }
+
+    public setIsActive(value: boolean): void {
+        this.log.debug('Setting isActive to:', value);
+        this.isActive = value;
+    }
+
+    /** Clear all pressed keys (used on focus switch to prevent stuck keys). */
+    public clearKeysPressed(): void {
+        for (const key of Object.keys(this.keysPressed)) {
+            this.keysPressed[key] = false;
+        }
+    }
+
+    /** Re-emit the solo autopilot state to the UI store. */
+    public emitAutopilotState(): void {
+        if (this.autopilot) {
+            try {
+                emitAutopilotStateChanged({
+                    enabled: this.autopilot.getAutopilotEnabled(),
+                    activeAutopilots: { ...this.autopilot.getActiveAutopilots() },
+                });
+            } catch {}
+        }
+    }
+
+    public getCurrentTarget(): string | null {
+        return this.currentTarget;
+    }
+
+    public setCurrentTarget(target: { uuid: string } | null): void {
+        this.currentTarget = target?.uuid || null;
+    }
+
+    private initializeProperties(spacecraft: Spacecraft, currentTarget: { uuid: string } | null, helpers: VisualizationCallbacks): void {
+        this.log.debug('Initializing SpacecraftController properties');
+        this.spacecraft = spacecraft;
+        this.currentTarget = currentTarget?.uuid || null;
+        this.helpers = helpers;
+
+        // For manual thruster control
+        this.keysPressed = {};
+
+        // Derive a "thrust per thruster"
+        this.mass = spacecraft.getMass();
+        this.thrust = (this.mass / 24) * THRUST_FACTOR;
+        this.baseThrust = this.thrust;
+        // Default per-thruster capacities (N). Can be customized later via config.
+        this.thrusterMax = new Array(24).fill(this.thrust);
+        this.thrusterPWM = new ThrusterPWM(this.thrust, this.thrusterMax);
+
+        // Create autopilot with correct parameters
+        const thrusterGroups = this.getThrusterGroups();
+        this.log.debug('Creating autopilot with thruster groups:', thrusterGroups);
+        
+        this.autopilot = new Autopilot(
+            this.spacecraft,
+            thrusterGroups,
+            this.thrust,
+            this.thrusterMax,
+            {
+                // Let autopilot use its procedural defaults - they're tuned for all spacecraft
+                // Only override if you have specific requirements
+                maxForce: this.thrust * 24,
+                dampingFactor: 1.5,
+                autoTune: false,
+                useWorker: true,
+            }
+        );
+
+        // Manual allocator uses the same config/groups/caps as autopilot
+        this.manualAllocator = new ManualAllocator(
+            this.spacecraft,
+            this.autopilot.getConfig(),
+            thrusterGroups,
+            this.thrust,
+            this.thrusterMax
+        );
+
+        // Do not enable autopilot by default; it will turn on when a mode is activated.
+        // This avoids running idle workers across many spacecraft.
+        this.log.debug('Autopilot created (initially disabled) with thrust:', this.thrust);
+    }
+
+    private getThrusterGroups(): ThrusterGroups {
+        try {
+            const thrusters: ThrusterConfig[] = this.spacecraft.getThrusterConfigs?.() || [];
+            if (Array.isArray(thrusters) && thrusters.length) {
+                // If docked, classify torques relative to the combined cluster COM so
+                // both spacecraft work in unison when firing rotational groups.
+                const partners = this.spacecraft.getDockedSpacecrafts?.() || [];
+                if (partners.length > 0) {
+                    // Compute world COM of the docked cluster
+                    const cluster = [this.spacecraft, ...partners];
+                    let mTot = 0;
+                    const comW = new THREE.Vector3(0, 0, 0);
+                    for (const s of cluster) {
+                        const m = Math.max(1e-6, s.getMass?.() || 0);
+                        const p = s.getWorldPosition?.();
+                        if (!p) continue;
+                        comW.addScaledVector(p, m);
+                        mTot += m;
+                    }
+                    if (mTot > 0) comW.multiplyScalar(1 / mTot);
+
+                    // Offset from our origin to COM expressed in our local frame
+                    const pW = this.spacecraft.getWorldPosition?.();
+                    const qW = this.spacecraft.getWorldOrientation?.();
+                    if (pW && qW) {
+                        const toComW = comW.clone().sub(pW);
+                        const qInv = qW.clone().invert();
+                        const toComLocal = toComW.applyQuaternion(qInv);
+                        // Shift thruster positions so r = thrusterPos - COMLocal (torque about COM)
+                        const shifted = thrusters.map((t: ThrusterConfig) => ({
+                            position: t.position.clone().sub(toComLocal),
+                            direction: t.direction.clone(),
+                        }));
+                        return computeThrusterGroups(shifted);
+                    }
+                }
+                // Default: classify in craft-local frame about its origin
+                return computeThrusterGroups(thrusters);
+            }
+        } catch (err) { this.log.warn('getThrusterGroups: failed to compute from configs, using basic groups', err); }
+        return getBasicThrusterGroups();
+    }
+
+    /**
+     * Recompute thruster grouping based on current thruster transforms and
+     * propagate updates into the autopilot (main + worker).
+     */
+    public refreshThrusterGroups(): void {
+        const groups = this.getThrusterGroups();
+        try { this.autopilot?.setThrusterGroups(groups); } catch (err) { this.log.warn('refreshThrusterGroups: autopilot setThrusterGroups failed', err); }
+        try { this.autopilot?.refreshThrusters?.(); } catch (err) { this.log.warn('refreshThrusterGroups: autopilot refreshThrusters failed', err); }
+        try { this.manualAllocator?.setThrusterGroups(groups); } catch (err) { this.log.warn('refreshThrusterGroups: manualAllocator setThrusterGroups failed', err); }
+        try { this.manualAllocator?.invalidateCaps?.(); } catch (err) { this.log.warn('refreshThrusterGroups: manualAllocator invalidateCaps failed', err); }
+    }
+
+    public handleKeyDown(event: KeyboardEvent): void {
+        if (!this.isActive) return;
+        if (this.keysPressed[event.code]) return;
+        this.keysPressed[event.code] = true;
+
+        // If compound authority exists, route autopilot toggles through it
+        if (this.compoundAuthority) {
+            this.compoundAuthority.handleAutopilotControl(event.code);
+        } else {
+            this.handleAutopilotControl(event.code);
+        }
+    }
+
+    public handleKeyUp(event: KeyboardEvent): void {
+        if (!this.isActive) return;
+        this.keysPressed[event.code] = false;
+    }
+
+    public handleAutopilotControl(code: string): void {
+        // Map keys to autopilot modes
+        const keyModeMap: { [key: string]: () => void } = {
+            'KeyT': () => {
+                this.log.debug('Toggling orientationMatch');
+                this.autopilot.orientationMatch();
+            },
+            'KeyY': () => {
+                this.log.debug('Toggling pointToPosition');
+                this.autopilot.pointToPosition();
+            },
+            'KeyR': () => {
+                this.log.debug('Toggling cancelRotation');
+                this.autopilot.cancelRotation();
+            },
+            'KeyG': () => {
+                this.log.debug('Toggling cancelLinearMotion');
+                this.autopilot.cancelLinearMotion();
+            },
+            'KeyB': () => {
+                this.log.debug('Toggling goToPosition');
+                this.autopilot.goToPosition();
+            }
+        };
+
+        // Execute the corresponding mode toggle if key is mapped
+        const modeToggle = keyModeMap[code];
+        if (modeToggle) {
+            this.log.debug('Executing mode toggle for key:', code);
+            modeToggle();
+            
+            // Log the new autopilot state
+            const activeAutopilots = this.autopilot.getActiveAutopilots();
+            this.log.debug('New autopilot state:', activeAutopilots);
+        }
+    }
+
+    /**
+     * Called each frame or physics step with dt
+     */
+    public applyForces(dt: number = 1/60): boolean[] {
+        // ── Compound body delegation ──
+        // If this spacecraft is part of a compound body with an authority,
+        // only the authority host runs the control loop.
+        if (this.compoundAuthority) {
+            // Mirror keysPressed from the active controller to the authority
+            if (this.isActive) {
+                this.compoundAuthority.keysPressed = { ...this.keysPressed };
+            }
+            // Only the root runs the authority's control loop
+            if (this.spacecraft === this.compoundAuthority.root) {
+                return this.compoundAuthority.applyForces(dt);
+            }
+            // Subordinate: visuals already updated by authority's distributeForces
+            return new Array(24).fill(false);
+        }
+
+        // ── Solo spacecraft (no compound) ──
+
+        // If no fuel access, zero all forces (thrusters disabled)
+        if (!this.spacecraft.hasFuelAccess()) {
+            this.combinedForcesBuffer.fill(0);
+            this.spacecraft.rcsVisuals.update(dt);
+            return new Array(24).fill(false);
+        }
+
+        // 1) Manual forces from user
+        const manualForces = this.calculateManualForces();
+
+        // 2) Autopilot forces if autopilot is active
+        const autopilotForces = this.autopilot.getAutopilotEnabled()
+            ? this.autopilot.calculateAutopilotForces(dt)
+            : (this.combinedForcesBuffer.fill(0), this.combinedForcesBuffer); // reuse buffer if disabled
+
+        // 3) Combine
+        // Combine into reusable buffer
+        for (let i = 0; i < 24; i++) {
+            this.combinedForcesBuffer[i] = (manualForces[i] || 0) + (autopilotForces[i] || 0);
+        }
+        const combined = this.combinedForcesBuffer;
+
+        // 4) Apply
+        const coneVisibility = this.applyForcesToThrusters(combined, dt);
+
+        // 5) Update RCS particle system
+        this.spacecraft.rcsVisuals.update(dt);
+
+        // 6) Debug helpers
+        this.updateHelpers(combined);
+
+        return coneVisibility;
+    }
+
+    // syncDockedAutopilots and updateClusterScaling removed —
+    // CompoundControlAuthority handles all compound body control.
+
+    private updateHelpers(thrustForces: number[]): void {
+        // Skip all work if no helper is visible and trace is off
+        const h = this.helpers;
+        if (!h) return;
+        const anyVisible = !!(
+            h.autopilotArrow?.visible ||
+            h.autopilotTorqueArrow?.visible ||
+            h.rotationAxisArrow?.visible ||
+            h.orientationArrow?.visible ||
+            h.velocityArrow?.visible ||
+            this.spacecraft?.showTraceLines ||
+            h.pathLine?.visible || h.pathCarrot?.visible
+        );
+        if (!anyVisible) return;
+
+        if (!this.autopilot?.getTargetOrientation()) return;
+
+        const bodyPosition = this.spacecraft.getWorldPositionRef();
+
+        // Compute only what is needed per visible helper
+        if (h.velocityArrow?.visible) {
+            const currentVelocity = this.spacecraft.getWorldVelocityRef();
+            this.helpers.updateVelocityArrow?.(bodyPosition, currentVelocity);
+        }
+
+        if (h.rotationAxisArrow?.visible) {
+            const currentAngularVelocity = this.spacecraft.getWorldAngularVelocityRef();
+            this.helpers.updateRotationAxisArrow?.(bodyPosition, currentAngularVelocity);
+        }
+
+        if (h.orientationArrow?.visible) {
+            const defaultForwardVector = new THREE.Vector3(0, 0, 1);
+            const orientationVector = defaultForwardVector.applyQuaternion(this.spacecraft.getWorldOrientationRef());
+            this.helpers.updateOrientationArrow?.(bodyPosition, orientationVector);
+        }
+
+        if (h.autopilotArrow?.visible) {
+            const defaultForwardVector = new THREE.Vector3(0, 0, 1);
+            const targetOrientationQuat = this.autopilot.getTargetOrientation();
+            const targetOrientationVector = defaultForwardVector.applyQuaternion(targetOrientationQuat);
+            this.helpers.updateAutopilotArrow?.(bodyPosition, targetOrientationVector);
+        }
+
+        if (h.autopilotTorqueArrow?.visible) {
+            const pitchTorque = thrustForces[0] + thrustForces[3] + thrustForces[4] + thrustForces[7];
+            const yawTorque   = thrustForces[8] + thrustForces[11] + thrustForces[12] + thrustForces[15];
+            const rollTorque  = thrustForces[1] + thrustForces[2] + thrustForces[5] + thrustForces[6];
+            const autopilotTorque = new THREE.Vector3(pitchTorque, yawTorque, rollTorque);
+            this.helpers.updateAutopilotTorqueArrow?.(bodyPosition, autopilotTorque);
+        }
+
+        // Update path visualization when enabled
+        if ((this.spacecraft as any)?.showPath && (h.pathLine?.visible || h.pathCarrot?.visible)) {
+            try {
+                const ap = this.autopilot;
+                const pts = ap.getPathSamples?.();
+                const carrot = ap.getPathCarrot?.();
+                if (pts && pts.length >= 2) {
+                    this.helpers.updatePath?.(pts, carrot || undefined);
+                }
+            } catch {}
+        }
+    }
+
+    private applyForcesToThrusters(forces: number[], dt: number): boolean[] {
+        const { visibility, applied } = this.thrusterPWM.apply(forces, dt);
+
+        // Consume fuel — scale applied forces if fuel is insufficient
+        let totalForce = 0;
+        for (let i = 0; i < 24; i++) totalForce += applied[i];
+        const fuelFraction = this.spacecraft.consumeFuel(totalForce, dt);
+        if (fuelFraction < 1) {
+            for (let i = 0; i < 24; i++) applied[i] *= fuelFraction;
+            if (fuelFraction <= 0) visibility.fill(false);
+        }
+
+        // Apply forces to RCS visuals and update cone mesh visibility
+        for (let i = 0; i < 24; i++) {
+            if (visibility[i]) {
+                this.spacecraft.rcsVisuals.applyForce(i, applied[i], dt);
+            }
+        }
+        this.spacecraft.rcsVisuals.getConeMeshes().forEach((coneMesh, index) => {
+            coneMesh.visible = visibility[index];
+        });
+
+        // Compute latest force metrics for scientific gradient
+        try {
+            const thrusters = this.spacecraft.getThrusterConfigs?.() || [];
+            let absSum = 0;
+            const net = new THREE.Vector3(0, 0, 0);
+            for (let i = 0; i < Math.min(24, applied.length, thrusters.length); i++) {
+                const f = applied[i] || 0;
+                absSum += Math.abs(f);
+                const dir = thrusters[i]?.direction;
+                if (dir && typeof dir.x === 'number') {
+                    net.x += dir.x * f;
+                    net.y += dir.y * f;
+                    net.z += dir.z * f;
+                }
+            }
+            const netMag = Math.sqrt(net.x * net.x + net.y * net.y + net.z * net.z);
+            this.helpers.setLatestForceMetrics?.(absSum, netMag);
+        } catch {}
+
+        return visibility;
+    }
+
+    private calculateManualForces(): number[] {
+        const out = this.manualForcesBuffer;
+        for (let i = 0; i < 24; i++) out[i] = 0;
+
+        // 1) Build desired local translation vector
+        // Semantics preserved: U (+Z fwd), O (-Z back), J (-X left), L (+X right), K (+Y up), I (-Y down)
+        const lin = new THREE.Vector3(0, 0, 0);
+        if (this.keysPressed['KeyU']) lin.z += 1; // forward
+        if (this.keysPressed['KeyO']) lin.z -= 1; // back
+        if (this.keysPressed['KeyJ']) lin.x -= 1; // left
+        if (this.keysPressed['KeyL']) lin.x += 1; // right
+        if (this.keysPressed['KeyK']) lin.y += 1; // up
+        if (this.keysPressed['KeyI']) lin.y -= 1; // down
+
+        // Scale to saturate per-axis groups (allocator clamps to group capacity)
+        const linScale = this.thrust * 24; // large enough to reach clamp
+        lin.multiplyScalar(linScale);
+
+        // 2) Build desired rotational command vector
+        const rot = new THREE.Vector3(0, 0, 0);
+        if (this.keysPressed['KeyW']) rot.x += 1; // pitch up
+        if (this.keysPressed['KeyS']) rot.x -= 1; // pitch down
+        if (this.keysPressed['KeyA']) rot.y += 1; // yaw left
+        if (this.keysPressed['KeyD']) rot.y -= 1; // yaw right
+        if (this.keysPressed['KeyQ']) rot.z += 1; // roll right
+        if (this.keysPressed['KeyE']) rot.z -= 1; // roll left
+
+        // Scale large enough to saturate thrusters (allocator clamps to tauAxisMax)
+        // Using a large value ensures full thrust authority
+        rot.multiplyScalar(100.0); // Large enough to reach full thrust on any axis
+
+        // 3) Allocate using the same distribution rules as the autopilot
+        // Translation first, then add rotation on top
+        this.manualAllocator.allocateTranslation(lin, out);
+        const tmp = new Array(24).fill(0);
+        this.manualAllocator.allocateRotation(rot, tmp);
+        for (let i = 0; i < 24; i++) out[i] += tmp[i];
+
+        return out;
+    }
+
+    public cleanup(): void {
+        // No global listeners to remove here; BasicWorld manages input
+
+        // Clean up autopilot
+        if (this.autopilot) {
+            this.autopilot.cleanup?.();
+        }
+
+        // Clean up helpers
+        if (this.helpers) {
+            this.helpers.cleanup?.();
+        }
+    }
+
+    public getThrust(): number {
+        return this.thrust;
+    }
+
+    public setThrust(value: number): void {
+        this.thrust = value;
+        // Update per-thruster capacities to match new thrust
+        this.thrusterMax = new Array(24).fill(value);
+
+        try { this.thrusterPWM?.setThrust(value); this.thrusterPWM?.setThrusterMax(this.thrusterMax); } catch (err) { this.log.warn('setThrust: PWM update failed', err); }
+        try { this.autopilot?.setThrust?.(value); } catch (err) { this.log.warn('setThrust: autopilot thrust update failed', err); }
+        try { this.autopilot?.setThrusterStrengths?.(this.thrusterMax); } catch (err) { this.log.warn('setThrust: autopilot strengths update failed', err); }
+        try { this.manualAllocator?.setThrust?.(value); } catch (err) { this.log.warn('setThrust: manualAllocator thrust update failed', err); }
+        try { this.manualAllocator?.setThrusterMax?.(this.thrusterMax); } catch (err) { this.log.warn('setThrust: manualAllocator max update failed', err); }
+        // Scale nozzle visuals proportionally to thrust (skip during cluster scaling — that's logical, not physical)
+        if (!this.isClusterScaling) {
+            try { this.spacecraft.rcsVisuals?.setNozzleScale?.(value, this.baseThrust); } catch {}
+        }
+    }
+
+    /**
+     * Set per-thruster maximum strengths (N). Array length must be 24.
+     * Updates local clamping and propagates to autopilot (main + worker).
+     */
+    public setThrusterStrengths(max: number[]): void {
+        if (!Array.isArray(max) || max.length !== 24) return;
+        this.thrusterMax = max.slice(0, 24);
+        try { this.thrusterPWM?.setThrusterMax(this.thrusterMax); } catch (err) { this.log.warn('setThrusterStrengths: PWM max update failed', err); }
+        try { this.autopilot?.setThrusterStrengths(this.thrusterMax); } catch (err) { this.log.warn('setThrusterStrengths: autopilot strengths update failed', err); }
+        try { this.manualAllocator?.setThrusterMax(this.thrusterMax); } catch (err) { this.log.warn('setThrusterStrengths: manualAllocator max update failed', err); }
+    }
+
+
+    public getSpacecraft(): Spacecraft {
+        return this.spacecraft;
+    }
+
+    public getAutopilot(): Autopilot {
+        // If compound authority exists, return its autopilot for UI binding
+        if (this.compoundAuthority) return this.compoundAuthority.autopilot;
+        return this.autopilot;
+    }
+
+    public getCompoundAuthority(): CompoundControlAuthority | null {
+        return this.compoundAuthority;
+    }
+
+    public setCompoundAuthority(authority: CompoundControlAuthority | null): void {
+        this.compoundAuthority = authority;
+        if (authority) {
+            // Suppress solo autopilot state emission while under compound control
+            this.autopilot.suppressStateEmit = true;
+        } else {
+            this.autopilot.suppressStateEmit = false;
+        }
+    }
+
+    public getTargetOrientation(): THREE.Quaternion {
+        return this.autopilot.getTargetOrientation();
+    }
+
+    public setTargetOrientation(orientation: THREE.Quaternion): void {
+        this.autopilot.setTargetOrientation(orientation);
+    }
+
+    public destroy(): void {
+        // No-op; BasicWorld manages global listeners
+    }
+
+    // no waypoint utilities
+
+    /**
+     * Immediately clear any latched thruster outputs and hide RCS visuals.
+     * Useful when external events (e.g., docking) require an abrupt stop.
+     */
+    public resetThrusterLatch(): void {
+        this.thrusterPWM.reset();
+        // Also clear any lingering visual effects
+        try {
+            this.spacecraft.rcsVisuals.getConeMeshes().forEach((cone) => (cone.visible = false));
+        } catch {}
+    }
+
+    handleKeyPress(event: KeyboardEvent): void {
+        if (event.key === 't' || event.key === 'T') {
+            this.log.debug('Toggling orientationMatch');
+            this.autopilot.orientationMatch();
+        }
+    }
+} 
